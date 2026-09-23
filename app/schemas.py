@@ -247,6 +247,49 @@ class ScheduleOut(BaseModel):
     )
 
 
+class CommitmentReuseAuditRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        min_length=2,
+        max_length=50,
+        description="待审计的 2～50 个事件 ID（重复 ID 自动去重；任一事件不存在返回 404）",
+    )
+
+
+class PriorRevealSourceOut(BaseModel):
+    event_id: UUID = Field(description="事先公开同一承诺的其他事件 ID")
+    commitment_id: UUID = Field(description="该事件中同哈希承诺的 ID")
+    reveal_id: UUID = Field(description="严格早于被审计承诺提交时间的揭示记录 ID")
+    revealed_at: datetime = Field(description="揭示时间（UTC）")
+
+
+class CommitmentReuseItemOut(BaseModel):
+    commitment_hash: str = Field(description="按大小写归一（小写）后的承诺哈希")
+    event_id: UUID = Field(description="该重复承诺所属事件")
+    commitment_id: UUID = Field(description="该重复承诺的 ID")
+    committed_at: datetime = Field(description="该承诺的提交时间（UTC）")
+    exposed_before_commit: bool = Field(
+        description=(
+            "是否存在其他事件同哈希且揭示时间严格早于本承诺提交时间的揭示；"
+            "同一时刻揭示不算事先公开"
+        )
+    )
+    prior_reveal_sources: list[PriorRevealSourceOut] = Field(
+        description="符合条件的其他事件揭示来源（按揭示时间、事件 ID、揭示 ID 排序）；无则为空"
+    )
+
+
+class CommitmentReuseAuditOut(BaseModel):
+    generated_at: datetime
+    event_count: int = Field(description="去重后实际参与审计的事件数量")
+    duplicate_hash_count: int = Field(
+        description="跨事件重复的不同承诺哈希数量（同一哈希出现在 >= 2 个事件）"
+    )
+    item_count: int = Field(description="重复承诺条目总数（等于 items 长度）")
+    items: list[CommitmentReuseItemOut] = Field(
+        description="跨事件重复承诺条目，按承诺哈希、提交时间、承诺 ID 稳定排序"
+    )
+
+
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str

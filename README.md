@@ -55,6 +55,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/schedule` | 批量事件的阶段窗口资源排程（最少轨道确定性着色） |
+| POST | `/events/commitments/reuse-audit` | 跨事件承诺复用审计：归一化哈希查重并标记「提交前已被他事件揭示」 |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
@@ -337,6 +338,87 @@ curl -s -X POST http://localhost:8000/events/schedule \
 | 400 | `INVALID_TRACK_LIMIT` | `track_limit` 缺失、为 null、不是整数（含布尔值）或小于 1 |
 | 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在 |
 | 422 | — | 事件 ID 非 UUID 或请求体结构错误 |
+
+## 跨事件承诺复用审计（`POST /events/commitments/reuse-audit`）
+
+在多个事件之间审计同一承诺哈希的复用情况，帮助发现「预测内容在 A 事件中已被公开、
+随后又被复用到 B 事件」的可疑行为。接口为**纯只读**，不改变任何提交、揭示与结算。
+
+请求体携带 **2～50 个**事件 ID（重复 ID 自动去重）。服务把各事件承诺的
+`commitment_hash` 按**大小写归一**（小写）后分组，仅当同一哈希出现在
+**>= 2 个不同事件**时列为重复项。每个重复项返回所属事件、承诺 ID 与提交时间，
+并逐项判定「提交前是否已被其他事件公开」：
+
+- 仅当**其他事件**中同哈希承诺存在揭示、且该揭示时间**严格早于**本项提交时间时，
+  才标记 `exposed_before_commit=true`，并在 `prior_reveal_sources` 中列出符合条件
+  的揭示来源（`event_id` / `commitment_id` / `reveal_id` / `revealed_at`）；
+- **同一时刻揭示不算事先公开**（必须严格早于）；同一事件自身的揭示也不计为来源；
+  不符合条件时 `exposed_before_commit=false`、来源列表为空；
+- 结果按 `(commitment_hash, committed_at, commitment_id)` **稳定排序**；
+  来源按 `(revealed_at, event_id, reveal_id)` 排序；
+- 审计范围仅限请求中的事件：未列入请求的事件即使有同哈希揭示也不作为来源。
+
+```bash
+curl -s -X POST http://localhost:8000/events/commitments/reuse-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_3>"]}'
+```
+
+```json
+{
+  "generated_at": "2030-07-01T12:00:00Z",
+  "event_count": 3,
+  "duplicate_hash_count": 1,
+  "item_count": 3,
+  "items": [
+    {
+      "commitment_hash": "9f2c7fd2…",
+      "event_id": "<EVENT_ID_1>",
+      "commitment_id": "<COMMITMENT_ID_1>",
+      "committed_at": "2030-06-01T00:00:00Z",
+      "exposed_before_commit": false,
+      "prior_reveal_sources": []
+    },
+    {
+      "commitment_hash": "9f2c7fd2…",
+      "event_id": "<EVENT_ID_2>",
+      "commitment_id": "<COMMITMENT_ID_2>",
+      "committed_at": "2030-06-05T00:00:00Z",
+      "exposed_before_commit": true,
+      "prior_reveal_sources": [
+        {
+          "event_id": "<EVENT_ID_1>",
+          "commitment_id": "<COMMITMENT_ID_1>",
+          "reveal_id": "<REVEAL_ID_1>",
+          "revealed_at": "2030-06-03T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "commitment_hash": "9f2c7fd2…",
+      "event_id": "<EVENT_ID_3>",
+      "commitment_id": "<COMMITMENT_ID_3>",
+      "committed_at": "2030-06-10T00:00:00Z",
+      "exposed_before_commit": true,
+      "prior_reveal_sources": [
+        {"event_id": "<EVENT_ID_1>", "commitment_id": "<COMMITMENT_ID_1>",
+         "reveal_id": "<REVEAL_ID_1>", "revealed_at": "2030-06-03T00:00:00Z"},
+        {"event_id": "<EVENT_ID_2>", "commitment_id": "<COMMITMENT_ID_2>",
+         "reveal_id": "<REVEAL_ID_2>", "revealed_at": "2030-06-08T00:00:00Z"}
+      ]
+    }
+  ]
+}
+```
+
+无跨事件重复时稳定返回空列表：`duplicate_hash_count=0`、`item_count=0`、`items=[]`
+（只在单个事件内出现的哈希，无论是否已揭示，均不列入）。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 审计完成（无重复时 `items` 为空） |
+| 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在（先去重再校验） |
+| 422 | — | 事件 ID 数量不在 2～50、ID 非 UUID 或请求体结构错误 |
 
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
@@ -689,7 +771,7 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 400 | `INVALID_TRACK_LIMIT` | 资源排程的 track_limit 缺失、非整数（含布尔值）或小于 1 |
 | 400 | `MISSING_SNAPSHOT_TIME` / `INVALID_SNAPSHOT_TIME` / `NAIVE_SNAPSHOT_TIME` | 历史快照缺少 `at`、时间无法解析或未携带时区 |
 | 400 | `SNAPSHOT_BEFORE_CREATION` | 快照时刻早于事件创建时间 |
-| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程请求中的任一 ID） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程/复用审计请求中的任一 ID） |
 | 404 | `COMMITMENT_NOT_FOUND` | 集合成员证明的承诺不存在或不属于该事件 |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
@@ -772,6 +854,7 @@ tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
 tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性
+tests/test_reuse_audit.py     # 跨事件承诺复用审计：归一化查重、严格早于揭示判定、排序与只读
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
