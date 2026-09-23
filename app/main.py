@@ -29,6 +29,9 @@ from .schemas import (
     CommitmentBatchOut,
     CommitmentCreate,
     CommitmentOut,
+    CommitmentReuseAuditOut,
+    CommitmentReuseAuditRequest,
+    CommitmentReuseItemOut,
     ConflictRequest,
     ConflictsOut,
     DeadlineExtensionCreate,
@@ -42,6 +45,7 @@ from .schemas import (
     MerkleProofStep,
     MerkleProofVerifyRequest,
     MerkleProofVerifyOut,
+    ReuseExposureSourceOut,
     RevealBatchCreate,
     RevealBatchOut,
     RevealCreate,
@@ -617,6 +621,128 @@ def schedule_event_tracks(payload: ScheduleRequest, db: Session = Depends(get_db
             )
             for c in result.conflicts
         ],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 跨事件承诺复用审计
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/commitments/reuse-audit", response_model=CommitmentReuseAuditOut)
+def audit_commitment_reuse(payload: CommitmentReuseAuditRequest, db: Session = Depends(get_db)):
+    """审计多个事件中按大小写归一哈希重复出现的承诺（纯只读）。
+
+    接收 2～50 个事件 ID（请求中的重复 ID 去重；任一事件不存在返回
+    404 EVENT_NOT_FOUND），加载这些事件的全部承诺，按归一化后的
+    commitment_hash 找出出现在**至少两个不同事件**中的重复哈希。
+
+    对每个重复哈希，返回它在各事件中的承诺条目（所属事件、承诺 ID、
+    提交时间）。对每个条目，检查**其他事件**中同哈希承诺的揭示：
+    仅当存在揭示时间**严格早于**该条目提交时间的揭示时，
+    exposed_before_commit 才为 true，并在 exposure_sources 中列出全部
+    符合条件的揭示来源（来源事件 ID、承诺 ID、揭示 ID、揭示时间）；
+    揭示时间与提交时间同刻（相等）不算事先公开，不列入；同一事件内的
+    揭示不属于「其他事件」，也不列入。
+
+    结果按 (commitment_hash, committed_at, commitment_id) 升序稳定排序，
+    每个条目的 exposure_sources 按 (revealed_at, event_id, reveal_id)
+    升序。时间均在 Python 侧按 UTC 时刻比较，不依赖数据库方言。
+    接口不写入、不修改任何数据，不改变提交、揭示与结算流程。
+    """
+    now = now_utc()
+    # 保序去重：同一事件只参与一次审计
+    event_ids = list(dict.fromkeys(payload.event_ids))
+
+    events_by_id: dict[UUID, Event] = {}
+    if event_ids:
+        events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+        events_by_id = {e.id: e for e in events}
+    missing = next((eid for eid in event_ids if eid not in events_by_id), None)
+    if missing is not None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {missing} 不存在")
+
+    # 一次性加载被审计事件的全部承诺；同事件内 (event_id, hash) 唯一，
+    # 故同一事件对同一哈希至多贡献一条
+    commitments = (
+        db.query(Commitment)
+        .filter(Commitment.event_id.in_(event_ids))
+        .all()
+    )
+    by_hash: dict[str, list[Commitment]] = {}
+    for c in commitments:
+        # 存储时已归一化为小写，这里再兜底一次，确保大小写归一
+        by_hash.setdefault(c.commitment_hash.lower(), []).append(c)
+
+    duplicate_hashes = {h for h, cs in by_hash.items() if len(cs) >= 2}
+
+    # 一次性加载重复哈希对应承诺的全部揭示（已限定为被审计事件）；
+    # 揭示事件以其承诺所属事件为准
+    reveal_rows: list[tuple[Commitment, Reveal]] = []
+    dup_commitment_ids = [c.id for h in duplicate_hashes for c in by_hash[h]]
+    if dup_commitment_ids:
+        rows = (
+            db.query(Commitment, Reveal)
+            .join(Reveal, Reveal.commitment_id == Commitment.id)
+            .filter(Commitment.id.in_(dup_commitment_ids))
+            .all()
+        )
+        reveal_rows = [(c, r) for c, r in rows]
+
+    # 归一化哈希 -> 其他事件揭示来源（在 Python 侧做严格时间比较）
+    exposures_by_hash: dict[str, list[tuple[Commitment, Reveal]]] = {}
+    for h in duplicate_hashes:
+        exposures_by_hash[h] = [
+            (c, r)
+            for c, r in reveal_rows
+            if c.commitment_hash.lower() == h
+        ]
+
+    items: list[CommitmentReuseItemOut] = []
+    for h in duplicate_hashes:
+        for c in by_hash[h]:
+            committed_at = as_utc(c.created_at)
+            sources = [
+                ReuseExposureSourceOut(
+                    event_id=src_c.event_id,
+                    commitment_id=src_c.id,
+                    reveal_id=src_r.id,
+                    revealed_at=as_utc(src_r.created_at),
+                )
+                # 仅「其他事件」且揭示时间严格早于本项提交时间才算事先公开；
+                # 同刻（==）不算，同事件揭示不算
+                for src_c, src_r in exposures_by_hash[h]
+                if src_c.event_id != c.event_id and as_utc(src_r.created_at) < committed_at
+            ]
+            sources.sort(
+                key=lambda s: (s.revealed_at, s.event_id, s.reveal_id)
+            )
+            items.append(
+                CommitmentReuseItemOut(
+                    commitment_hash=h,
+                    event_id=c.event_id,
+                    commitment_id=c.id,
+                    committed_at=committed_at,
+                    exposed_before_commit=bool(sources),
+                    exposure_sources=sources,
+                )
+            )
+
+    # 稳定排序：哈希、提交时间、承诺 ID 三级升序（UUID 按 128 位整数比较，
+    # 与 Merkle 叶排序一致，避免依赖数据库 / 字符串排序差异）
+    items.sort(
+        key=lambda item: (
+            item.commitment_hash,
+            item.committed_at,
+            item.commitment_id.int,
+        )
+    )
+
+    return CommitmentReuseAuditOut(
+        generated_at=now,
+        event_count=len(event_ids),
+        duplicate_hash_count=len(duplicate_hashes),
+        item_count=len(items),
+        items=items,
     )
 
 

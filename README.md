@@ -55,6 +55,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/schedule` | 批量事件的阶段窗口资源排程（最少轨道确定性着色） |
+| POST | `/events/commitments/reuse-audit` | 跨事件承诺复用审计（重复哈希与「提交前是否已在其他事件揭示」） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
@@ -337,6 +338,81 @@ curl -s -X POST http://localhost:8000/events/schedule \
 | 400 | `INVALID_TRACK_LIMIT` | `track_limit` 缺失、为 null、不是整数（含布尔值）或小于 1 |
 | 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在 |
 | 422 | — | 事件 ID 非 UUID 或请求体结构错误 |
+
+## 跨事件承诺复用审计（`POST /events/commitments/reuse-audit`）
+
+一次性审计 **2～50 个事件**中按**大小写归一**的承诺哈希找出跨事件重复项——
+即同一归一化哈希出现在至少两个不同事件中的承诺。对每个重复承诺返回其所属
+事件、承诺 ID 与提交时间，并判定它在提交时是否**已经能从其他事件的公开
+揭示中看到**（纯只读，不影响提交、揭示与结算）：
+
+- `exposed_before_commit=true` **当且仅当**存在**其他事件**中同哈希承诺的
+  揭示时间**严格早于**该承诺的提交时间；同刻揭示（揭示时间 == 提交时间）
+  **不算**事先公开，本事件自身的揭示也不算；
+- `exposure_sources` 列出全部满足条件的揭示来源（来源事件 ID、来源承诺 ID、
+  揭示 ID、揭示时间），不满足时为空数组。
+
+```bash
+curl -s -X POST http://localhost:8000/events/commitments/reuse-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_3>"]}'
+```
+
+```json
+{
+  "generated_at": "2030-06-01T12:00:00Z",
+  "event_count": 3,
+  "duplicate_hash_count": 1,
+  "item_count": 2,
+  "items": [
+    {
+      "commitment_hash": "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d",
+      "event_id": "<EVENT_ID_1>",
+      "commitment_id": "<COMMITMENT_ID_1>",
+      "committed_at": "2030-01-01T00:30:00Z",
+      "exposed_before_commit": false,
+      "exposure_sources": []
+    },
+    {
+      "commitment_hash": "9f2c7fd25e1b3afad3e85a0bd17d9b100db4b3bd306a4f6e5535e23e15e82d7d",
+      "event_id": "<EVENT_ID_2>",
+      "commitment_id": "<COMMITMENT_ID_2>",
+      "committed_at": "2030-02-01T00:00:00Z",
+      "exposed_before_commit": true,
+      "exposure_sources": [
+        {
+          "event_id": "<EVENT_ID_1>",
+          "commitment_id": "<COMMITMENT_ID_1>",
+          "reveal_id": "<REVEAL_ID_1>",
+          "revealed_at": "2030-01-10T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
+
+语义与排序：
+
+- 请求中的**重复事件 ID 自动去重**后参与审计，`event_count` 回显去重后的
+  事件数；任一事件 ID 不存在返回 `404 EVENT_NOT_FOUND`；事件 ID 少于 2 个
+  或多于 50 个、ID 非 UUID 返回 422；
+- 仅在**至少两个不同事件**出现的哈希才计入：`duplicate_hash_count` 为重复
+  哈希个数，`item_count` 为这些哈希在各事件中的承诺条目总数；无重复时
+  两者均为 0、`items` 为空数组；
+- `items` 按 `(commitment_hash, committed_at, commitment_id)` 升序稳定排序；
+  每个条目的 `exposure_sources` 按 `(revealed_at, event_id, reveal_id)`
+  升序；
+- 哈希比较大小写不敏感（大写哈希归并到小写后判定，回显统一为小写）；
+  所有时间按 UTC 时刻严格比较；
+- 审计为纯只读查询，**不改变提交、揭示与结算**，等价输入（打乱顺序或夹带
+  重复 ID）返回结果一致。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 审计成功（无重复时 `items` 为空数组） |
+| 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在 |
+| 422 | — | 事件 ID 少于 2 个或多于 50 个、ID 非 UUID、请求体结构错误 |
 
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
@@ -689,7 +765,7 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 400 | `INVALID_TRACK_LIMIT` | 资源排程的 track_limit 缺失、非整数（含布尔值）或小于 1 |
 | 400 | `MISSING_SNAPSHOT_TIME` / `INVALID_SNAPSHOT_TIME` / `NAIVE_SNAPSHOT_TIME` | 历史快照缺少 `at`、时间无法解析或未携带时区 |
 | 400 | `SNAPSHOT_BEFORE_CREATION` | 快照时刻早于事件创建时间 |
-| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程请求中的任一 ID） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程/复用审计请求中的任一 ID） |
 | 404 | `COMMITMENT_NOT_FOUND` | 集合成员证明的承诺不存在或不属于该事件 |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
@@ -772,6 +848,7 @@ tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
 tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性
+tests/test_reuse_audit.py     # 跨事件承诺复用审计：重复识别、严格早于的事先公开判定、稳定排序与只读性
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
